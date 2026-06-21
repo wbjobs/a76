@@ -1,3 +1,4 @@
+use crate::crypto::{derive_key_from_password, generate_device_id, generate_hex_key, sha256_hex};
 use crate::db;
 use crate::db::CreateInjectionLogParams;
 use crate::error::{AppError, AppResult};
@@ -7,9 +8,11 @@ use crate::process::{
 };
 use crate::scanner::{scan_process, snapshot_region};
 use crate::state::AppState;
+use crate::sync::SyncClient;
 use crate::types::{
-    DataBlock, InjectionLog, InjectionResult, InjectionStep, MemoryRegion, ProcessInfo,
-    ScanConfig, Snapshot, SnapshotCreateParams,
+    DataBlock, DiffChunk, DiffResult, InjectionLog, InjectionResult, InjectionStep, MemoryRegion,
+    ProcessInfo, ScanConfig, Snapshot, SnapshotCreateParams, SyncConfigInfo, SyncConfigParams,
+    SyncResult, SyncStatus,
 };
 use chrono::Utc;
 use serde::{Deserialize, Serialize};
@@ -873,4 +876,390 @@ pub fn setup_global_shortcut(app: &mut tauri::App) -> AppResult<()> {
         });
 
     Ok(())
+}
+
+// ===== 同步配置命令 =====
+
+#[tauri::command]
+pub async fn get_sync_config(state: State<'_, AppState>) -> AppResult<Option<SyncConfigInfo>> {
+    let db = state.db.read();
+    let config = db::get_sync_config(&db)?;
+    Ok(config.map(|c| SyncConfigInfo {
+        server_address: c.server_address,
+        device_id: c.device_id,
+        device_name: c.device_name,
+        auto_sync: c.auto_sync,
+        last_sync: c.last_sync,
+        updated_at: c.updated_at,
+        has_key: !c.encryption_key.is_empty(),
+    }))
+}
+
+#[tauri::command]
+pub async fn set_sync_config(state: State<'_, AppState>, params: SyncConfigParams) -> AppResult<SyncConfigInfo> {
+    let derived_key = derive_key_from_password(&params.encryption_password);
+    let encryption_key = hex::encode(derived_key);
+    
+    let device_id = {
+        let db = state.db.read();
+        db::get_sync_config(&db)?
+            .map(|c| c.device_id)
+            .unwrap_or_else(generate_device_id)
+    };
+
+    let config = db::SyncConfig {
+        server_address: params.server_address,
+        encryption_key,
+        device_id: device_id.clone(),
+        device_name: params.device_name,
+        auto_sync: params.auto_sync,
+        last_sync: None,
+        updated_at: Utc::now().to_rfc3339(),
+    };
+
+    {
+        let db = state.db.write();
+        db::set_sync_config(&db, &config)?;
+    }
+
+    Ok(SyncConfigInfo {
+        server_address: config.server_address,
+        device_id: config.device_id,
+        device_name: config.device_name,
+        auto_sync: config.auto_sync,
+        last_sync: config.last_sync,
+        updated_at: config.updated_at,
+        has_key: true,
+    })
+}
+
+#[tauri::command]
+pub async fn clear_sync_config(state: State<'_, AppState>) -> AppResult<()> {
+    let mut sync_client = state.sync_client.lock().await;
+    if let Some(mut client) = sync_client.take() {
+        let _ = client.disconnect().await;
+    }
+    
+    let db = state.db.write();
+    db.execute("DELETE FROM sync_config WHERE id = 1", [])?;
+    Ok(())
+}
+
+// ===== 同步连接命令 =====
+
+#[tauri::command]
+pub async fn connect_sync(state: State<'_, AppState>) -> AppResult<SyncStatus> {
+    let config = {
+        let db = state.db.read();
+        db::get_sync_config(&db)?
+            .ok_or_else(|| AppError::Other("请先配置同步服务器".into()))?
+    };
+
+    let mut sync_client = SyncClient::new(config);
+    sync_client.connect().await?;
+    
+    let status = sync_client.get_status();
+    *state.sync_client.lock().await = Some(sync_client);
+    
+    Ok(status)
+}
+
+#[tauri::command]
+pub async fn disconnect_sync(state: State<'_, AppState>) -> AppResult<SyncStatus> {
+    let mut sync_client_opt = state.sync_client.lock().await;
+    if let Some(mut client) = sync_client_opt.take() {
+        let _ = client.disconnect().await;
+        return Ok(SyncStatus {
+            connected: false,
+            server_address: client.get_status().server_address,
+            last_sync: None,
+            cloud_snapshot_count: 0,
+            error: None,
+        });
+    }
+    
+    Ok(SyncStatus {
+        connected: false,
+        server_address: String::new(),
+        last_sync: None,
+        cloud_snapshot_count: 0,
+        error: None,
+    })
+}
+
+#[tauri::command]
+pub async fn get_sync_status(state: State<'_, AppState>) -> AppResult<SyncStatus> {
+    let sync_client_opt = state.sync_client.lock().await;
+    if let Some(client) = sync_client_opt.as_ref() {
+        return Ok(client.get_status());
+    }
+    
+    let db = state.db.read();
+    let config = db::get_sync_config(&db)?;
+    Ok(SyncStatus {
+        connected: false,
+        server_address: config.map(|c| c.server_address).unwrap_or_default(),
+        last_sync: config.and_then(|c| c.last_sync),
+        cloud_snapshot_count: 0,
+        error: None,
+    })
+}
+
+// ===== 同步操作命令 =====
+
+#[tauri::command]
+pub async fn sync_push_all(state: State<'_, AppState>) -> AppResult<SyncResult> {
+    let sync_client = state.sync_client.lock().await;
+    let client = sync_client.as_ref()
+        .ok_or_else(|| AppError::Other("未连接同步服务器".into()))?;
+
+    let snapshots = {
+        let db = state.db.read();
+        db::list_snapshots(&db, None, None, 1000, 0)?
+    };
+
+    if snapshots.is_empty() {
+        return Ok(SyncResult {
+            success: true,
+            pushed: 0,
+            pulled: 0,
+            error: None,
+        });
+    }
+
+    let result = client.push_snapshots(&snapshots).await?;
+    let pushed_count = result["results"].as_array()
+        .map(|arr| arr.iter().filter(|r| r["error"].is_null()).count() as i64)
+        .unwrap_or(0);
+
+    {
+        let db = state.db.write();
+        db::update_sync_last_sync(&db, &Utc::now().to_rfc3339())?;
+    }
+
+    Ok(SyncResult {
+        success: true,
+        pushed: pushed_count,
+        pulled: 0,
+        error: None,
+    })
+}
+
+#[tauri::command]
+pub async fn sync_pull_all(state: State<'_, AppState>) -> AppResult<SyncResult> {
+    let sync_client = state.sync_client.lock().await;
+    let client = sync_client.as_ref()
+        .ok_or_else(|| AppError::Other("未连接同步服务器".into()))?;
+
+    let config = {
+        let db = state.db.read();
+        db::get_sync_config(&db)?
+    };
+
+    let after = config.as_ref().and_then(|c| c.last_sync.clone());
+    let cloud_snapshots = client.pull_snapshots(after, 500).await?;
+
+    let mut inserted = 0i64;
+    {
+        let db = state.db.write();
+        for snap in &cloud_snapshots {
+            let exists = db.query_row(
+                "SELECT 1 FROM snapshots WHERE id = ?",
+                [snap.id],
+                |_| Ok(true),
+            ).optional()?.unwrap_or(false);
+            
+            if !exists {
+                let params = SnapshotCreateParams {
+                    process_name: snap.process_name.clone(),
+                    pid: snap.pid,
+                    address: snap.address,
+                    size: snap.size,
+                    data_type: snap.data_type,
+                    content: snap.content.clone(),
+                    raw_data: snap.raw_data.clone(),
+                    note: snap.note.clone(),
+                };
+                db::create_snapshot(&db, &params)?;
+                inserted += 1;
+            }
+        }
+        
+        db::update_sync_last_sync(&db, &Utc::now().to_rfc3339())?;
+    }
+
+    Ok(SyncResult {
+        success: true,
+        pushed: 0,
+        pulled: inserted,
+        error: None,
+    })
+}
+
+#[tauri::command]
+pub async fn sync_push_ids(state: State<'_, AppState>, snapshot_ids: Vec<i64>) -> AppResult<SyncResult> {
+    let sync_client = state.sync_client.lock().await;
+    let client = sync_client.as_ref()
+        .ok_or_else(|| AppError::Other("未连接同步服务器".into()))?;
+
+    let mut snapshots = Vec::new();
+    {
+        let db = state.db.read();
+        for id in snapshot_ids {
+            if let Some(snap) = db::get_snapshot(&db, id)? {
+                snapshots.push(snap);
+            }
+        }
+    }
+
+    if snapshots.is_empty() {
+        return Ok(SyncResult {
+            success: true,
+            pushed: 0,
+            pulled: 0,
+            error: None,
+        });
+    }
+
+    let result = client.push_snapshots(&snapshots).await?;
+    let pushed_count = result["results"].as_array()
+        .map(|arr| arr.iter().filter(|r| r["error"].is_null()).count() as i64)
+        .unwrap_or(0);
+
+    {
+        let db = state.db.write();
+        db::update_sync_last_sync(&db, &Utc::now().to_rfc3339())?;
+    }
+
+    Ok(SyncResult {
+        success: true,
+        pushed: pushed_count,
+        pulled: 0,
+        error: None,
+    })
+}
+
+#[tauri::command]
+pub async fn generate_encryption_key() -> AppResult<String> {
+    Ok(generate_hex_key())
+}
+
+// ===== 快照差异对比 =====
+
+fn compute_diff(old_bytes: &[u8], new_bytes: &[u8]) -> Vec<DiffChunk> {
+    let mut chunks = Vec::new();
+    let min_len = old_bytes.len().min(new_bytes.len());
+    
+    let mut i = 0;
+    while i < min_len {
+        if old_bytes[i] != new_bytes[i] {
+            let start = i;
+            while i < min_len && old_bytes[i] != new_bytes[i] {
+                i += 1;
+            }
+            let end = i;
+            
+            let old_hex = hex::encode(&old_bytes[start..end.min(old_bytes.len())]);
+            let new_hex = hex::encode(&new_bytes[start..end.min(new_bytes.len())]);
+            
+            chunks.push(DiffChunk {
+                kind: "modify".into(),
+                old_start: start,
+                old_end: end.min(old_bytes.len()),
+                new_start: start,
+                new_end: end.min(new_bytes.len()),
+                old_content: old_hex,
+                new_content: new_hex,
+            });
+        } else {
+            i += 1;
+        }
+    }
+
+    if old_bytes.len() > new_bytes.len() {
+        chunks.push(DiffChunk {
+            kind: "delete".into(),
+            old_start: new_bytes.len(),
+            old_end: old_bytes.len(),
+            new_start: new_bytes.len(),
+            new_end: new_bytes.len(),
+            old_content: hex::encode(&old_bytes[new_bytes.len()..]),
+            new_content: String::new(),
+        });
+    } else if new_bytes.len() > old_bytes.len() {
+        chunks.push(DiffChunk {
+            kind: "insert".into(),
+            old_start: old_bytes.len(),
+            old_end: old_bytes.len(),
+            new_start: old_bytes.len(),
+            new_end: new_bytes.len(),
+            old_content: String::new(),
+            new_content: hex::encode(&new_bytes[old_bytes.len()..]),
+        });
+    }
+
+    chunks
+}
+
+fn bytes_to_preview(bytes: &[u8], max_len: usize) -> String {
+    let take = bytes.len().min(max_len);
+    let hex = hex::encode(&bytes[..take]);
+    if bytes.len() > max_len {
+        format!("{}... ({} bytes total)", hex, bytes.len())
+    } else {
+        hex
+    }
+}
+
+fn calculate_similarity(old: &[u8], new: &[u8]) -> f64 {
+    if old.is_empty() && new.is_empty() {
+        return 1.0;
+    }
+    if old.is_empty() || new.is_empty() {
+        return 0.0;
+    }
+    
+    let min_len = old.len().min(new.len());
+    let mut matches = 0;
+    for i in 0..min_len {
+        if old[i] == new[i] {
+            matches += 1;
+        }
+    }
+    
+    let max_len = old.len().max(new.len());
+    matches as f64 / max_len as f64
+}
+
+#[tauri::command]
+pub async fn diff_snapshots(state: State<'_, AppState>, old_id: i64, new_id: i64) -> AppResult<DiffResult> {
+    let db = state.db.read();
+    
+    let old_snap = db::get_snapshot(&db, old_id)?
+        .ok_or_else(|| AppError::InvalidSnapshotId(old_id))?;
+    let new_snap = db::get_snapshot(&db, new_id)?
+        .ok_or_else(|| AppError::InvalidSnapshotId(new_id))?;
+    
+    let old_bytes = hex::decode(&old_snap.raw_data)
+        .map_err(|e| AppError::Other(format!("旧快照数据解码失败: {}", e)))?;
+    let new_bytes = hex::decode(&new_snap.raw_data)
+        .map_err(|e| AppError::Other(format!("新快照数据解码失败: {}", e)))?;
+    
+    let chunks = compute_diff(&old_bytes, &new_bytes);
+    let changed_bytes: usize = chunks.iter()
+        .map(|c| (c.old_end - c.old_start).max(c.new_end - c.new_start))
+        .sum();
+    let similarity = calculate_similarity(&old_bytes, &new_bytes);
+    
+    Ok(DiffResult {
+        old_id,
+        new_id,
+        old_size: old_bytes.len(),
+        new_size: new_bytes.len(),
+        changed_bytes,
+        similarity,
+        chunks,
+        old_preview: bytes_to_preview(&old_bytes, 256),
+        new_preview: bytes_to_preview(&new_bytes, 256),
+    })
 }

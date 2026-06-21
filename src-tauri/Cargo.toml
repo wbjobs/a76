@@ -27,6 +27,15 @@ base64 = "0.22"
 thiserror = "1"
 anyhow = "1"
 parking_lot = "0.12"
+aes-gcm = "0.10"
+sha2 = "0.10"
+pbkdf2 = "0.12"
+rand = "0.8"
+hex = "0.4"
+tokio-tungstenite = "0.21"
+tokio = { version = "1", features = ["full"] }
+futures = "0.3"
+url = "2"
 
 [target.'cfg(windows)'.dependencies]
 winapi = { version = "0.3", features = ["tlhelp32", "memoryapi", "processthreadsapi", "handleapi", "psapi", "winbase", "synchapi", "winnt", "errhandlingapi", "securitybaseapi", "wow64apiset", "libloaderapi", "windef", "impl-default", "minwindef", "ntdef"] }

@@ -43,6 +43,17 @@ pub fn init_db(conn: &Connection) -> AppResult<()> {
         CREATE INDEX IF NOT EXISTS idx_injection_logs_pid ON injection_logs(target_pid);
         CREATE INDEX IF NOT EXISTS idx_injection_logs_snapshot ON injection_logs(snapshot_id);
         CREATE INDEX IF NOT EXISTS idx_injection_logs_created ON injection_logs(created_at DESC);
+
+        CREATE TABLE IF NOT EXISTS sync_config (
+            id INTEGER PRIMARY KEY CHECK (id = 1),
+            server_address TEXT NOT NULL,
+            encryption_key TEXT NOT NULL,
+            device_id TEXT NOT NULL,
+            device_name TEXT,
+            auto_sync INTEGER NOT NULL DEFAULT 0,
+            last_sync TEXT,
+            updated_at TEXT NOT NULL
+        );
         "#,
     )?;
     Ok(())
@@ -261,4 +272,121 @@ pub fn get_injection_log(conn: &Connection, id: i64) -> AppResult<Option<Injecti
         .query_row(params![id], row_to_injection_log)
         .optional()?;
     Ok(res)
+}
+
+// ===== 同步配置 CRUD =====
+
+#[derive(Debug, Clone, serde::Serialize, serde::Deserialize)]
+pub struct SyncConfig {
+    pub server_address: String,
+    pub encryption_key: String,
+    pub device_id: String,
+    pub device_name: Option<String>,
+    pub auto_sync: bool,
+    pub last_sync: Option<String>,
+    pub updated_at: String,
+}
+
+pub fn get_sync_config(conn: &Connection) -> AppResult<Option<SyncConfig>> {
+    let res = conn
+        .query_row(
+            "SELECT server_address, encryption_key, device_id, device_name, auto_sync, last_sync, updated_at 
+             FROM sync_config WHERE id = 1",
+            [],
+            |row| {
+                Ok(SyncConfig {
+                    server_address: row.get(0)?,
+                    encryption_key: row.get(1)?,
+                    device_id: row.get(2)?,
+                    device_name: row.get(3)?,
+                    auto_sync: row.get::<_, i32>(4)? != 0,
+                    last_sync: row.get(5)?,
+                    updated_at: row.get(6)?,
+                })
+            },
+        )
+        .optional()?;
+    Ok(res)
+}
+
+pub fn set_sync_config(conn: &Connection, config: &SyncConfig) -> AppResult<()> {
+    let now = Utc::now().to_rfc3339();
+    conn.execute(
+        r#"INSERT INTO sync_config 
+           (id, server_address, encryption_key, device_id, device_name, auto_sync, last_sync, updated_at)
+           VALUES (1, ?1, ?2, ?3, ?4, ?5, ?6, ?7)
+           ON CONFLICT(id) DO UPDATE SET
+               server_address = excluded.server_address,
+               encryption_key = excluded.encryption_key,
+               device_id = excluded.device_id,
+               device_name = excluded.device_name,
+               auto_sync = excluded.auto_sync,
+               last_sync = COALESCE(excluded.last_sync, sync_config.last_sync),
+               updated_at = excluded.updated_at"#,
+        params![
+            config.server_address,
+            config.encryption_key,
+            config.device_id,
+            config.device_name,
+            config.auto_sync as i32,
+            config.last_sync,
+            now,
+        ],
+    )?;
+    Ok(())
+}
+
+pub fn update_sync_last_sync(conn: &Connection, last_sync: &str) -> AppResult<()> {
+    conn.execute(
+        "UPDATE sync_config SET last_sync = ?, updated_at = ? WHERE id = 1",
+        params![last_sync, Utc::now().to_rfc3339()],
+    )?;
+    Ok(())
+}
+
+// ===== DB 快照 <-> API 快照 转换 =====
+
+#[derive(Debug, serde::Serialize, serde::Deserialize)]
+pub struct DbSnapshot {
+    pub id: i64,
+    pub process_name: String,
+    pub pid: i64,
+    pub address: i64,
+    pub size: i64,
+    pub data_type: String,
+    pub content: Option<String>,
+    pub raw_data: String,
+    pub note: Option<String>,
+    pub created_at: String,
+}
+
+pub fn snapshot_to_db(snap: &crate::types::Snapshot) -> DbSnapshot {
+    DbSnapshot {
+        id: snap.id,
+        process_name: snap.process_name.clone(),
+        pid: snap.pid as i64,
+        address: snap.address as i64,
+        size: snap.size as i64,
+        data_type: serde_json::to_string(&snap.data_type).unwrap_or_default(),
+        content: snap.content.clone(),
+        raw_data: snap.raw_data.clone(),
+        note: snap.note.clone(),
+        created_at: snap.created_at.clone(),
+    }
+}
+
+pub fn db_to_snapshot(db: &DbSnapshot) -> crate::types::Snapshot {
+    let data_type = serde_json::from_str(&db.data_type).unwrap_or(crate::types::DataType::Json);
+    crate::types::Snapshot {
+        id: db.id,
+        process_name: db.process_name.clone(),
+        pid: db.pid as u32,
+        address: db.address as u64,
+        size: db.size as usize,
+        data_type,
+        content: db.content.clone(),
+        raw_data: db.raw_data.clone(),
+        note: db.note.clone(),
+        created_at: db.created_at.clone(),
+    }
 }

@@ -105,6 +105,60 @@ export interface InjectionLog {
   created_at: string;
 }
 
+export interface SyncConfigParams {
+  server_address: string;
+  encryption_password: string;
+  device_name?: string | null;
+  auto_sync: boolean;
+}
+
+export interface SyncConfigInfo {
+  server_address: string;
+  device_id: string;
+  device_name?: string | null;
+  auto_sync: boolean;
+  last_sync?: string | null;
+  updated_at: string;
+  has_key: boolean;
+}
+
+export interface SyncStatus {
+  connected: boolean;
+  server_address: string;
+  last_sync?: string | null;
+  cloud_snapshot_count: number;
+  error?: string | null;
+}
+
+export interface SyncResult {
+  success: boolean;
+  pushed: number;
+  pulled: number;
+  error?: string | null;
+}
+
+export interface DiffChunk {
+  kind: "insert" | "delete" | "modify";
+  old_start: number;
+  old_end: number;
+  new_start: number;
+  new_end: number;
+  old_content: string;
+  new_content: string;
+}
+
+export interface DiffResult {
+  old_id: number;
+  new_id: number;
+  old_size: number;
+  new_size: number;
+  changed_bytes: number;
+  similarity: number;
+  chunks: DiffChunk[];
+  old_preview: string;
+  new_preview: string;
+}
+
 export const categoryLabel: Record<ProcessCategory, string> = {
   Browser: "浏览器",
   IDE: "IDE",
@@ -180,4 +234,19 @@ export const api = {
   hideFloatingPanel: () => invoke<void>("hide_floating_panel"),
   listenQuickScan: (cb: () => void) =>
     event.listen("shortcut-quick-scan", () => cb()),
+
+  getSyncConfig: () => invoke<SyncConfigInfo | null>("get_sync_config"),
+  setSyncConfig: (params: SyncConfigParams) =>
+    invoke<SyncConfigInfo>("set_sync_config", { params }),
+  clearSyncConfig: () => invoke<void>("clear_sync_config"),
+  connectSync: () => invoke<SyncStatus>("connect_sync"),
+  disconnectSync: () => invoke<SyncStatus>("disconnect_sync"),
+  getSyncStatus: () => invoke<SyncStatus>("get_sync_status"),
+  syncPushAll: () => invoke<SyncResult>("sync_push_all"),
+  syncPullAll: () => invoke<SyncResult>("sync_pull_all"),
+  syncPushIds: (ids: number[]) =>
+    invoke<SyncResult>("sync_push_ids", { snapshot_ids: ids }),
+  generateEncryptionKey: () => invoke<string>("generate_encryption_key"),
+  diffSnapshots: (oldId: number, newId: number) =>
+    invoke<DiffResult>("diff_snapshots", { old_id: oldId, new_id: newId }),
 };

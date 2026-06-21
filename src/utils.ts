@@ -70,6 +70,12 @@ export function toast(message: string, kind: "info" | "success" | "error" = "inf
   }
 }
 
+export const toastApi = {
+  success: (msg: string) => toast(msg, "success"),
+  error: (msg: string) => toast(msg, "error"),
+  info: (msg: string) => toast(msg, "info"),
+};
+
 export function copyToClipboard(text: string) {
   navigator.clipboard?.writeText(text).catch(() => {
     const ta = document.createElement("textarea");

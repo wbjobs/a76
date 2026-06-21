@@ -200,3 +200,63 @@ pub struct InjectionLog {
     pub steps_json: String,
     pub created_at: String,
 }
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct SyncConfigParams {
+    pub server_address: String,
+    pub encryption_password: String,
+    pub device_name: Option<String>,
+    pub auto_sync: bool,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct SyncConfigInfo {
+    pub server_address: String,
+    pub device_id: String,
+    pub device_name: Option<String>,
+    pub auto_sync: bool,
+    pub last_sync: Option<String>,
+    pub updated_at: String,
+    pub has_key: bool,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct SyncStatus {
+    pub connected: bool,
+    pub server_address: String,
+    pub last_sync: Option<String>,
+    pub cloud_snapshot_count: i64,
+    pub error: Option<String>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct SyncResult {
+    pub success: bool,
+    pub pushed: i64,
+    pub pulled: i64,
+    pub error: Option<String>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct DiffChunk {
+    pub kind: String,
+    pub old_start: usize,
+    pub old_end: usize,
+    pub new_start: usize,
+    pub new_end: usize,
+    pub old_content: String,
+    pub new_content: String,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct DiffResult {
+    pub old_id: i64,
+    pub new_id: i64,
+    pub old_size: usize,
+    pub new_size: usize,
+    pub changed_bytes: usize,
+    pub similarity: f64,
+    pub chunks: Vec<DiffChunk>,
+    pub old_preview: String,
+    pub new_preview: String,
+}

@@ -4,10 +4,12 @@ import { ScanPanel } from "../components/ScanPanel";
 import { ScanResults } from "../components/ScanResults";
 import { SnapshotList } from "../components/SnapshotList";
 import { InjectDialog } from "../components/InjectDialog";
-import { ProcessInfo, DataBlock, Snapshot, api, ScanConfig, ProcessCategory } from "../api";
+import SyncSettings from "../components/SyncSettings";
+import DiffView from "../components/DiffView";
+import { ProcessInfo, DataBlock, Snapshot, api, ScanConfig, ProcessCategory, SyncStatus } from "../api";
 import { useAsync, toast } from "../utils";
 
-type Tab = "scan" | "snapshots";
+type Tab = "scan" | "snapshots" | "sync" | "diff";
 
 export function MainApp() {
   const [tab, setTab] = useState<Tab>("scan");
@@ -19,6 +21,7 @@ export function MainApp() {
   const [scanning, setScanning] = useState(false);
   const [injectOpen, setInjectOpen] = useState(false);
   const [injectSnapshot, setInjectSnapshot] = useState<Snapshot | null>(null);
+  const [syncStatus, setSyncStatus] = useState<SyncStatus | null>(null);
 
   const processesHook = useAsync(() => api.listProcesses(), [], { immediate: true });
 
@@ -28,6 +31,20 @@ export function MainApp() {
     { immediate: true }
   );
   const snapshots = rawSnapshots ?? [];
+
+  const { data: statusData, loading: statusLoading, refresh: refreshSyncStatus } = useAsync(api.getSyncStatus, [], {
+    onError: () => {},
+  });
+
+  useEffect(() => {
+    if (statusData) setSyncStatus(statusData);
+  }, [statusData]);
+
+  useEffect(() => {
+    refreshSyncStatus();
+    const interval = setInterval(() => refreshSyncStatus(), 10000);
+    return () => clearInterval(interval);
+  }, [refreshSyncStatus]);
 
   useEffect(() => {
     const bind = async () => {
@@ -129,6 +146,29 @@ export function MainApp() {
           >
             快照历史
           </button>
+          <button
+            onClick={() => setTab("diff")}
+            className={`px-3 py-1 rounded text-sm transition ${
+              tab === "diff"
+                ? "bg-accent-cyan text-dark-300 font-medium"
+                : "text-gray-300 hover:text-gray-100"
+            }`}
+          >
+            📊 差异对比
+          </button>
+          <button
+            onClick={() => setTab("sync")}
+            className={`px-3 py-1 rounded text-sm transition flex items-center gap-1.5 ${
+              tab === "sync"
+                ? "bg-accent-cyan text-dark-300 font-medium"
+                : "text-gray-300 hover:text-gray-100"
+            }`}
+          >
+            ☁️ 云同步
+            {syncStatus?.connected && (
+              <span className="w-2 h-2 bg-green-400 rounded-full animate-pulse" title="已连接"></span>
+            )}
+          </button>
         </nav>
         <div className="flex items-center gap-2 text-xs text-gray-400">
           <span className="chip bg-dark-400 border border-gray-700">
@@ -178,7 +218,7 @@ export function MainApp() {
                 />
               </div>
             </>
-          ) : (
+          ) : tab === "snapshots" ? (
             <div className="flex-1 min-h-0">
               <SnapshotList
                 snapshots={snapshots}
@@ -187,6 +227,14 @@ export function MainApp() {
                 onRefresh={() => refreshSnaps().catch(() => {})}
                 onInject={openInject}
               />
+            </div>
+          ) : tab === "diff" ? (
+            <div className="flex-1 min-h-0 bg-gray-50 rounded-lg border border-gray-200">
+              <DiffView snapshots={snapshots} />
+            </div>
+          ) : (
+            <div className="flex-1 min-h-0 bg-gray-50 rounded-lg border border-gray-200">
+              <SyncSettings />
             </div>
           )}
         </section>

@@ -4,11 +4,13 @@
 )]
 
 mod commands;
+mod crypto;
 mod db;
 mod error;
 mod process;
 mod scanner;
 mod state;
+mod sync;
 mod types;
 
 use commands::*;
@@ -54,6 +56,17 @@ fn main() {
             toggle_floating_panel,
             show_floating_panel,
             hide_floating_panel,
+            get_sync_config,
+            set_sync_config,
+            clear_sync_config,
+            connect_sync,
+            disconnect_sync,
+            get_sync_status,
+            sync_push_all,
+            sync_pull_all,
+            sync_push_ids,
+            generate_encryption_key,
+            diff_snapshots,
         ])
         .setup(|app| {
             // 设置全局快捷键
