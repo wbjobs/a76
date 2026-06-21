@@ -6,20 +6,23 @@ use std::collections::HashSet;
 mod platform {
     use super::*;
     use std::mem;
-    use winapi::shared::minwindef::{BOOL, DWORD, HMODULE, LPVOID, TRUE};
+    use winapi::shared::minwindef::{DWORD, HMODULE, LPVOID};
     use winapi::um::handleapi::CloseHandle;
-    use winapi::um::memoryapi::{VirtualQueryEx, ReadProcessMemory, WriteProcessMemory};
+    use winapi::um::memoryapi::{VirtualAllocEx, VirtualFreeEx, VirtualQueryEx, ReadProcessMemory, WriteProcessMemory};
+    use winapi::um::processthreadsapi::{OpenProcess, CreateRemoteThread, WaitForSingleObject};
     use winapi::um::psapi::{EnumProcessModules, GetModuleBaseNameA, GetProcessMemoryInfo};
-    use winapi::um::processthreadsapi::OpenProcess;
+    use winapi::um::synchapi::INFINITE;
     use winapi::um::tlhelp32::{
         CreateToolhelp32Snapshot, Process32FirstW, Process32NextW, PROCESSENTRY32W,
         TH32CS_SNAPPROCESS,
     };
     use winapi::um::winnt::{
         HANDLE, MEMORY_BASIC_INFORMATION, PAGE_EXECUTE_READ, PAGE_EXECUTE_READWRITE,
-        PAGE_READONLY, PAGE_READWRITE, PROCESS_QUERY_INFORMATION, PROCESS_VM_OPERATION,
+        PAGE_READONLY, PAGE_READWRITE, PAGE_READWRITE, MEM_COMMIT, MEM_RESERVE,
+        MEM_RELEASE, PROCESS_ALL_ACCESS, PROCESS_QUERY_INFORMATION, PROCESS_VM_OPERATION,
         PROCESS_VM_READ, PROCESS_VM_WRITE, PROCESS_MEMORY_COUNTERS,
     };
+    use winapi::um::libloaderapi::{GetModuleHandleA, GetProcAddress};
 
     pub fn open_process(pid: u32, access: DWORD) -> AppResult<HANDLE> {
         unsafe {
@@ -165,7 +168,7 @@ mod platform {
                 let protect = mbi.Protect;
                 let state = mbi.State;
                 let is_readable = protect & (PAGE_READONLY | PAGE_READWRITE | PAGE_EXECUTE_READ | PAGE_EXECUTE_READWRITE) != 0
-                    && state == 0x1000; // MEM_COMMIT
+                    && state == MEM_COMMIT;
                 let is_writable = protect & (PAGE_READWRITE | PAGE_EXECUTE_READWRITE) != 0;
 
                 if is_readable {
@@ -239,6 +242,132 @@ mod platform {
             Ok(bytes_written)
         }
     }
+
+    // ===== 安全注入 API =====
+
+    pub fn virtual_alloc_ex(pid: u32, size: usize) -> AppResult<u64> {
+        unsafe {
+            let handle = open_process(pid, PROCESS_VM_OPERATION)?;
+            let addr = VirtualAllocEx(
+                handle,
+                std::ptr::null_mut(),
+                size,
+                MEM_COMMIT | MEM_RESERVE,
+                PAGE_READWRITE,
+            );
+            CloseHandle(handle);
+            if addr.is_null() {
+                return Err(AppError::MemoryWriteFailed {
+                    address: 0,
+                    source: format!("VirtualAllocEx failed, size={}, error={}", size, last_err()).into(),
+                });
+            }
+            Ok(addr as u64)
+        }
+    }
+
+    pub fn virtual_free_ex(pid: u32, address: u64, size: usize) -> AppResult<()> {
+        unsafe {
+            let handle = open_process(pid, PROCESS_VM_OPERATION)?;
+            let ret = VirtualFreeEx(
+                handle,
+                address as LPVOID,
+                size,
+                MEM_RELEASE,
+            );
+            CloseHandle(handle);
+            if ret == 0 {
+                return Err(AppError::MemoryWriteFailed {
+                    address,
+                    source: format!("VirtualFreeEx failed at 0x{:X}, error={}", address, last_err()).into(),
+                });
+            }
+            Ok(())
+        }
+    }
+
+    pub fn get_module_proc_address(module: &str, proc_name: &str) -> AppResult<u64> {
+        unsafe {
+            let module_name = std::ffi::CString::new(module)
+                .map_err(|e| AppError::Other(format!("模块名无效: {}", e)))?;
+            let proc_cname = std::ffi::CString::new(proc_name)
+                .map_err(|e| AppError::Other(format!("函数名无效: {}", e)))?;
+
+            let h_module = GetModuleHandleA(module_name.as_ptr() as *const i8);
+            if h_module.is_null() {
+                return Err(AppError::Other(format!(
+                    "GetModuleHandleA({}) failed, error={}",
+                    module, last_err()
+                )));
+            }
+
+            let proc_addr = GetProcAddress(h_module, proc_cname.as_ptr() as *const i8);
+            if proc_addr.is_none() {
+                return Err(AppError::Other(format!(
+                    "GetProcAddress({}!{}) failed, error={}",
+                    module, proc_name, last_err()
+                )));
+            }
+
+            Ok(proc_addr.unwrap() as u64)
+        }
+    }
+
+    pub fn create_remote_threadAndWait(
+        pid: u32,
+        thread_func: u64,
+        param: u64,
+    ) -> AppResult<u32> {
+        unsafe {
+            let handle = open_process(
+                pid,
+                PROCESS_VM_OPERATION | PROCESS_VM_WRITE | PROCESS_VM_READ
+                    | PROCESS_QUERY_INFORMATION | PROCESS_CREATE_THREAD,
+            )?;
+
+            let thread_handle = CreateRemoteThread(
+                handle,
+                std::ptr::null_mut(),
+                0,
+                Some(std::mem::transmute::<usize, unsafe extern "system" fn(*mut std::ffi::c_void) -> u32>(thread_func as usize)),
+                param as LPVOID,
+                0,
+                std::ptr::null_mut(),
+            );
+
+            if thread_handle.is_null() {
+                CloseHandle(handle);
+                return Err(AppError::MemoryWriteFailed {
+                    address: thread_func,
+                    source: format!("CreateRemoteThread failed, error={}", last_err()).into(),
+                });
+            }
+
+            let wait = WaitForSingleObject(thread_handle, INFINITE);
+            if wait != 0 {
+                CloseHandle(thread_handle);
+                CloseHandle(handle);
+                return Err(AppError::MemoryWriteFailed {
+                    address: thread_func,
+                    source: format!("WaitForSingleObject returned {}, error={}", wait, last_err()).into(),
+                });
+            }
+
+            let mut exit_code: DWORD = 0;
+            let get_exit = winapi::um::processthreadsapi::GetExitCodeThread(thread_handle, &mut exit_code);
+            CloseHandle(thread_handle);
+            CloseHandle(handle);
+
+            if get_exit == 0 {
+                return Err(AppError::MemoryWriteFailed {
+                    address: thread_func,
+                    source: format!("GetExitCodeThread failed, error={}", last_err()).into(),
+                });
+            }
+
+            Ok(exit_code)
+        }
+    }
 }
 
 #[cfg(target_os = "macos")]
@@ -247,10 +376,10 @@ mod platform {
     use libproc::libproc::proc_pid;
     use mach2::kern_return;
     use mach2::port::{mach_port_name_t, mach_port_t, MACH_PORT_NULL};
-    use mach2::vm::{mach_vm_read, mach_vm_write, mach_vm_region, vm_deallocate};
+    use mach2::vm::{mach_vm_read, mach_vm_write, mach_vm_region, vm_deallocate, mach_vm_allocate};
     use mach2::vm_statistics::{vm_region_basic_info_data_64_t, VM_REGION_BASIC_INFO_64, VM_REGION_BASIC_INFO_COUNT_64};
     use mach2::message::mach_msg_type_number_t;
-    use mach2::vm_prot::{VM_PROT_READ, VM_PROT_WRITE};
+    use mach2::vm_prot::{VM_PROT_READ, VM_PROT_WRITE, VM_PROT_ALL};
     use mach2::tasks::task_for_pid;
     use std::ptr;
     use std::mem;
@@ -270,7 +399,6 @@ mod platform {
     }
 
     pub fn list_processes() -> AppResult<Vec<ProcessInfo>> {
-        use std::ptr;
         let mut types = unsafe { std::mem::zeroed() };
         let mut count = 0;
         let pids = proc_pid::listpids(0, &mut types, &mut count)
@@ -403,6 +531,63 @@ mod platform {
             }
             Ok(data.len())
         }
+    }
+
+    // ===== macOS 安全注入 API =====
+
+    pub fn virtual_alloc_ex(pid: u32, size: usize) -> AppResult<u64> {
+        unsafe {
+            let task = task_for_pid_safe(pid)?;
+            let mut addr: u64 = 0;
+            let kr = mach_vm_allocate(
+                task,
+                &mut addr,
+                size as u64,
+                1,
+            );
+            if kr != kern_return::KERN_SUCCESS {
+                return Err(AppError::MemoryWriteFailed {
+                    address: 0,
+                    source: format!("mach_vm_allocate failed: kern={}", kr).into(),
+                });
+            }
+            Ok(addr)
+        }
+    }
+
+    pub fn virtual_free_ex(pid: u32, address: u64, size: usize) -> AppResult<()> {
+        unsafe {
+            let task = task_for_pid_safe(pid)?;
+            let kr = mach_vm_allocate(
+                task,
+                &mut (address as u64),
+                size as u64,
+                0,
+            );
+            if kr != kern_return::KERN_SUCCESS {
+                return Err(AppError::MemoryWriteFailed {
+                    address,
+                    source: format!("mach_vm_allocate(dealloc) failed: kern={}", kr).into(),
+                });
+            }
+            Ok(())
+        }
+    }
+
+    pub fn get_module_proc_address(_module: &str, _proc_name: &str) -> AppResult<u64> {
+        Err(AppError::Other(
+            "macOS 不支持 GetProcAddress 等效操作，请使用 direct mach_vm_write 注入".into(),
+        ))
+    }
+
+    pub fn create_remote_thread_and_wait(
+        _pid: u32,
+        _thread_func: u64,
+        _param: u64,
+    ) -> AppResult<u32> {
+        Err(AppError::Other(
+            "macOS 不支持 CreateRemoteThread，已回退到直接写入模式".into(),
+        ))
     }
 }
 

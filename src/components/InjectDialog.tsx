@@ -1,5 +1,5 @@
 import { useEffect, useState } from "react";
-import { Snapshot, ProcessInfo, api, InjectionResult } from "../api";
+import { Snapshot, ProcessInfo, api, InjectionResult, InjectionStep, InjectionLog } from "../api";
 import { cls, toast, formatTime } from "../utils";
 
 interface Props {
@@ -15,14 +15,23 @@ export function InjectDialog({ open, snapshot, processes, onClose, onDone }: Pro
   const [addr, setAddr] = useState("");
   const [loading, setLoading] = useState(false);
   const [result, setResult] = useState<InjectionResult | null>(null);
+  const [recentLogs, setRecentLogs] = useState<InjectionLog[]>([]);
 
   useEffect(() => {
     if (open && snapshot) {
       setPid(snapshot.pid);
       setAddr("0x" + snapshot.address.toString(16).toUpperCase());
       setResult(null);
+      loadLogs();
     }
   }, [open, snapshot]);
+
+  const loadLogs = async () => {
+    try {
+      const logs = await api.listInjectionLogs(null, snapshot?.id ?? null, 10, 0);
+      setRecentLogs(logs);
+    } catch {}
+  };
 
   if (!open || !snapshot) return null;
 
@@ -51,6 +60,7 @@ export function InjectDialog({ open, snapshot, processes, onClose, onDone }: Pro
         toast(res.message, "error");
       }
       onDone?.(res);
+      loadLogs();
     } catch (e: any) {
       toast(`注入失败: ${e}`, "error");
     } finally {
@@ -60,14 +70,14 @@ export function InjectDialog({ open, snapshot, processes, onClose, onDone }: Pro
 
   return (
     <div className="fixed inset-0 z-50 flex items-center justify-center bg-black/60 backdrop-blur-sm">
-      <div className="card p-5 w-[560px] max-w-[90vw] max-h-[85vh] overflow-auto">
+      <div className="card p-5 w-[680px] max-w-[92vw] max-h-[90vh] overflow-auto">
         <div className="flex items-start justify-between mb-4">
           <div>
             <h3 className="font-semibold text-lg text-accent-cyan">
-              🚀 内存注入
+              �️ 安全注入
             </h3>
             <p className="text-xs text-gray-400 mt-1">
-              将快照 #{snapshot.id} 的内容写回目标进程的指定内存地址
+              VirtualAllocEx → WriteProcessMemory → shellcode(RtlMoveMemory) → CreateRemoteThread
             </p>
           </div>
           <button
@@ -100,10 +110,6 @@ export function InjectDialog({ open, snapshot, processes, onClose, onDone }: Pro
               <div className="text-gray-400">大小</div>
               <div className="text-gray-100">{snapshot.size} bytes</div>
             </div>
-            <div className="col-span-2">
-              <div className="text-gray-400">创建时间</div>
-              <div className="text-gray-100">{formatTime(snapshot.created_at)}</div>
-            </div>
           </div>
         </div>
 
@@ -124,14 +130,9 @@ export function InjectDialog({ open, snapshot, processes, onClose, onDone }: Pro
                 </option>
               ))}
             </select>
-            {target && (
-              <div className="text-[11px] text-gray-400 mt-1">
-                目标进程内存: {target.memory_mb.toFixed(1)} MB · 路径: {target.path ?? "未知"}
-              </div>
-            )}
             {pid && !target && (
               <div className="text-[11px] text-accent-yellow mt-1">
-                ⚠ 当前进程 PID={pid} 不在运行中，建议先刷新进程列表
+                ⚠ PID={pid} 不在运行中
               </div>
             )}
           </div>
@@ -147,36 +148,158 @@ export function InjectDialog({ open, snapshot, processes, onClose, onDone }: Pro
               onChange={(e) => setAddr(e.target.value)}
               placeholder="0x..."
             />
-            <div className="text-[11px] text-gray-400 mt-1">
-              留空或默认会使用快照原始地址:{" "}
-              <span className="font-mono text-accent-purple">
-                0x{snapshot.address.toString(16).toUpperCase()}
-              </span>
-            </div>
           </div>
 
-          <div className="text-[11px] bg-accent-yellow/10 border border-accent-yellow/30 rounded p-2 text-accent-yellow">
-            ⚠️ <strong>安全提示：</strong>
-            错误的地址或大小写入会导致目标进程崩溃（AccessViolation / SegFault）。
-            系统会自动检查目标地址是否属于可写内存区域，但仍建议在测试环境操作。
+          <div className="text-[11px] bg-accent-cyan/10 border border-accent-cyan/30 rounded p-2.5 text-accent-cyan space-y-1.5">
+            <div className="font-semibold">🛡️ 安全注入流程</div>
+            <ol className="list-decimal list-inside space-y-0.5 text-gray-300">
+              <li>校验目标地址是否在可写内存区域</li>
+              <li>ReadProcessMemory 备份目标原始数据（用于回滚恢复）</li>
+              <li>VirtualAllocEx 在目标进程分配临时 RW 内存页</li>
+              <li>WriteProcessMemory 将快照数据写入临时区</li>
+              <li>解析 ntdll!RtlMoveMemory 地址，构建 x64 shellcode</li>
+              <li>WriteProcessMemory 将 shellcode 写入临时区末尾</li>
+              <li>CreateRemoteThread 执行 shellcode（调用 RtlMoveMemory 拷贝数据）</li>
+              <li>WaitForSingleObject 等待远程线程完成</li>
+              <li>ReadProcessMemory 验证写入数据匹配率</li>
+              <li>VirtualFreeEx 释放临时区，清理痕迹</li>
+            </ol>
+            <div className="text-accent-yellow mt-1">
+              ⚠️ 任何步骤失败将自动回滚：释放临时区 + 恢复备份原始数据
+            </div>
           </div>
         </div>
 
         {result && (
-          <div
-            className={cls(
-              "mt-4 p-3 rounded border text-xs",
-              result.success
-                ? "bg-accent-green/10 border-accent-green/30 text-accent-green"
-                : "bg-accent-red/10 border-accent-red/30 text-accent-red"
-            )}
-          >
-            <div className="font-semibold mb-1">
-              {result.success ? "✓ 注入成功" : "✗ 注入失败"}
+          <div className="mt-4 space-y-3">
+            <div
+              className={cls(
+                "p-3 rounded border text-xs",
+                result.success
+                  ? "bg-accent-green/10 border-accent-green/30 text-accent-green"
+                  : "bg-accent-red/10 border-accent-red/30 text-accent-red"
+              )}
+            >
+              <div className="font-semibold mb-1 text-sm">
+                {result.success ? "✓ 注入成功" : "✗ 注入失败"}
+                {result.rolled_back && (
+                  <span className="ml-2 text-accent-yellow font-normal">（已自动回滚）</span>
+                )}
+              </div>
+              <div>地址: 0x{result.address.toString(16).toUpperCase()}</div>
+              <div>已写入: {result.bytes_written} / {snapshot.size} bytes</div>
+              {result.temp_alloc_address && (
+                <div>
+                  临时区: 0x{result.temp_alloc_address.toString(16).toUpperCase()}（已释放）
+                </div>
+              )}
+              {result.memcpy_result != null && (
+                <div>远程线程退出码: {result.memcpy_result}</div>
+              )}
+              {result.log_id && (
+                <div>日志ID: #{result.log_id}</div>
+              )}
+              <div className="mt-1">{result.message}</div>
             </div>
-            <div>地址: 0x{result.address.toString(16).toUpperCase()}</div>
-            <div>已写入: {result.bytes_written} / {snapshot.size} bytes</div>
-            <div className="mt-1">{result.message}</div>
+
+            {/* 注入步骤详情 */}
+            {result.steps.length > 0 && (
+              <div className="rounded border border-dark-400 overflow-hidden">
+                <div className="bg-dark-400 px-3 py-1.5 text-xs font-semibold text-gray-300">
+                  注入步骤详情 ({result.steps.length} 步)
+                </div>
+                <div className="max-h-64 overflow-auto">
+                  <table className="w-full text-[11px]">
+                    <thead>
+                      <tr className="bg-dark-400 text-gray-400">
+                        <th className="px-2 py-1 text-left">状态</th>
+                        <th className="px-2 py-1 text-left">步骤</th>
+                        <th className="px-2 py-1 text-left">地址</th>
+                        <th className="px-2 py-1 text-left">大小</th>
+                        <th className="px-2 py-1 text-left">返回值 / 错误</th>
+                        <th className="px-2 py-1 text-left">时间</th>
+                      </tr>
+                    </thead>
+                    <tbody>
+                      {result.steps.map((s, i) => (
+                        <tr
+                          key={i}
+                          className={cls(
+                            "border-t border-dark-400",
+                            s.success ? "text-gray-200" : "text-accent-red"
+                          )}
+                        >
+                          <td className="px-2 py-1">
+                            {s.success ? "✓" : "✗"}
+                          </td>
+                          <td className="px-2 py-1 font-medium">{s.step}</td>
+                          <td className="px-2 py-1 font-mono">
+                            {s.address != null
+                              ? `0x${s.address.toString(16).toUpperCase()}`
+                              : "-"}
+                          </td>
+                          <td className="px-2 py-1">
+                            {s.size != null ? `${s.size}B` : "-"}
+                          </td>
+                          <td className="px-2 py-1 max-w-[200px] truncate">
+                            {s.error ? (
+                              <span className="text-accent-red">{s.error}</span>
+                            ) : (
+                              s.return_value
+                            )}
+                          </td>
+                          <td className="px-2 py-1 text-gray-400 whitespace-nowrap">
+                            {s.timestamp.split("T")[1]?.split(".")[0] ?? s.timestamp}
+                          </td>
+                        </tr>
+                      ))}
+                    </tbody>
+                  </table>
+                </div>
+              </div>
+            )}
+          </div>
+        )}
+
+        {/* 历史注入日志 */}
+        {recentLogs.length > 0 && (
+          <div className="mt-4">
+            <div className="text-xs font-semibold text-gray-400 mb-2">
+              该快照的历史注入记录 ({recentLogs.length})
+            </div>
+            <div className="max-h-32 overflow-auto space-y-1">
+              {recentLogs.map((log) => (
+                <div
+                  key={log.id}
+                  className={cls(
+                    "flex items-center gap-2 px-2 py-1 rounded text-[11px] border",
+                    log.success
+                      ? "bg-accent-green/5 border-accent-green/20"
+                      : "bg-accent-red/5 border-accent-red/20"
+                  )}
+                >
+                  <span className={log.success ? "text-accent-green" : "text-accent-red"}>
+                    {log.success ? "✓" : "✗"}
+                  </span>
+                  <span className="text-gray-300">#{log.id}</span>
+                  <span className="text-gray-400">
+                    PID={log.target_pid} → 0x{log.target_address.toString(16).toUpperCase()}
+                  </span>
+                  <span className="text-gray-400">{log.data_size}B</span>
+                  {log.rolled_back && (
+                    <span className="text-accent-yellow">已回滚</span>
+                  )}
+                  {log.temp_alloc_address && (
+                    <span className="text-gray-500">
+                      临时区=0x{log.temp_alloc_address.toString(16).toUpperCase()}
+                    </span>
+                  )}
+                  <span className="ml-auto text-gray-500">
+                    {formatTime(log.created_at)}
+                  </span>
+                </div>
+              ))}
+            </div>
           </div>
         )}
 
@@ -185,7 +308,7 @@ export function InjectDialog({ open, snapshot, processes, onClose, onDone }: Pro
             {result ? "关闭" : "取消"}
           </button>
           <button className="btn-success" onClick={run} disabled={loading || !pid}>
-            {loading ? "注入中..." : "确认注入"}
+            {loading ? "注入中..." : "🛡️ 安全注入"}
           </button>
         </div>
       </div>

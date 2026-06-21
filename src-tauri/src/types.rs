@@ -166,4 +166,37 @@ pub struct InjectionResult {
     pub address: u64,
     pub bytes_written: usize,
     pub message: String,
+    pub log_id: Option<i64>,
+    pub steps: Vec<InjectionStep>,
+    pub rolled_back: bool,
+    pub temp_alloc_address: Option<u64>,
+    pub memcpy_result: Option<u32>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct InjectionStep {
+    pub step: String,
+    pub success: bool,
+    pub address: Option<u64>,
+    pub size: Option<usize>,
+    pub return_value: Option<String>,
+    pub error: Option<String>,
+    pub timestamp: String,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct InjectionLog {
+    pub id: i64,
+    pub snapshot_id: i64,
+    pub target_pid: u32,
+    pub target_address: u64,
+    pub data_size: usize,
+    pub temp_alloc_address: Option<u64>,
+    pub temp_alloc_size: Option<usize>,
+    pub memcpy_address: Option<u64>,
+    pub thread_exit_code: Option<i64>,
+    pub success: bool,
+    pub rolled_back: bool,
+    pub steps_json: String,
+    pub created_at: String,
 }

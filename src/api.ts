@@ -72,6 +72,37 @@ export interface InjectionResult {
   address: number;
   bytes_written: number;
   message: string;
+  log_id: number | null;
+  steps: InjectionStep[];
+  rolled_back: boolean;
+  temp_alloc_address: number | null;
+  memcpy_result: number | null;
+}
+
+export interface InjectionStep {
+  step: string;
+  success: boolean;
+  address: number | null;
+  size: number | null;
+  return_value: string | null;
+  error: string | null;
+  timestamp: string;
+}
+
+export interface InjectionLog {
+  id: number;
+  snapshot_id: number;
+  target_pid: number;
+  target_address: number;
+  data_size: number;
+  temp_alloc_address: number | null;
+  temp_alloc_size: number | null;
+  memcpy_address: number | null;
+  thread_exit_code: number | null;
+  success: boolean;
+  rolled_back: boolean;
+  steps_json: string;
+  created_at: string;
 }
 
 export const categoryLabel: Record<ProcessCategory, string> = {
@@ -132,6 +163,15 @@ export const api = {
       targetPid,
       targetAddress,
     }),
+  listInjectionLogs: (targetPid?: number | null, snapshotId?: number | null, limit = 100, offset = 0) =>
+    invoke<InjectionLog[]>("list_injection_logs", {
+      targetPid,
+      snapshotId,
+      limit,
+      offset,
+    }),
+  getInjectionLog: (id: number) =>
+    invoke<InjectionLog | null>("get_injection_log", { id }),
   setActivePid: (pid: number | null) => invoke<void>("set_active_pid", { pid }),
   getActivePid: () => invoke<number | null>("get_active_pid"),
   setMonitored: (pids: number[]) => invoke<void>("set_monitored_pids", { pids }),

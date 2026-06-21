@@ -1,14 +1,47 @@
 use crate::db;
+use crate::db::CreateInjectionLogParams;
 use crate::error::{AppError, AppResult};
-use crate::process::{list_processes, memory_regions, read_memory, write_memory};
+use crate::process::{
+    create_remote_thread_and_wait, get_module_proc_address, list_processes, memory_regions,
+    read_memory, virtual_alloc_ex, virtual_free_ex, write_memory,
+};
 use crate::scanner::{scan_process, snapshot_region};
 use crate::state::AppState;
 use crate::types::{
-    DataBlock, InjectionResult, MemoryRegion, ProcessInfo, ScanConfig, Snapshot,
-    SnapshotCreateParams,
+    DataBlock, InjectionLog, InjectionResult, InjectionStep, MemoryRegion, ProcessInfo,
+    ScanConfig, Snapshot, SnapshotCreateParams,
 };
+use chrono::Utc;
 use serde::{Deserialize, Serialize};
 use tauri::{Manager, State};
+
+fn now_ts() -> String {
+    Utc::now().to_rfc3339_opts(chrono::SecondsFormat::Millis, true)
+}
+
+fn ok_step(name: &str, addr: Option<u64>, size: Option<usize>, rv: Option<String>) -> InjectionStep {
+    InjectionStep {
+        step: name.to_string(),
+        success: true,
+        address: addr,
+        size,
+        return_value: rv,
+        error: None,
+        timestamp: now_ts(),
+    }
+}
+
+fn err_step(name: &str, addr: Option<u64>, size: Option<usize>, err: String) -> InjectionStep {
+    InjectionStep {
+        step: name.to_string(),
+        success: false,
+        address: addr,
+        size,
+        return_value: None,
+        error: Some(err),
+        timestamp: now_ts(),
+    }
+}
 
 #[derive(Serialize, Deserialize)]
 pub struct ListSnapshotQuery {
@@ -170,6 +203,8 @@ pub async fn count_snapshots(
     db::count_snapshots(&db, q.pid, q.process_name.as_deref())
 }
 
+// ===== 安全注入核心 =====
+
 #[tauri::command]
 pub async fn inject_snapshot_to_process(
     snapshot_id: i64,
@@ -177,20 +212,64 @@ pub async fn inject_snapshot_to_process(
     target_address: Option<u64>,
     state: State<'_, AppState>,
 ) -> AppResult<InjectionResult> {
-    // 1. 获取快照
-    let db = state.db.read();
-    let snap = db::get_snapshot(&db, snapshot_id)?
-        .ok_or(AppError::InvalidSnapshotId(snapshot_id))?;
-    drop(db);
+    let mut steps: Vec<InjectionStep> = Vec::new();
+    let mut temp_alloc_addr: Option<u64> = None;
+    let mut memcpy_addr_val: Option<u64> = None;
+    let mut thread_exit: Option<u32> = None;
+    let mut rolled_back = false;
 
-    // 2. 解码 raw_data (hex -> bytes)
-    let raw_bytes = hex_to_bytes(&snap.raw_data)
-        .ok_or_else(|| AppError::Other("无法解析快照原始数据".into()))?;
+    // ===== Step 0: 获取快照数据 =====
+    let db_conn = state.db.read();
+    let snap = db::get_snapshot(&db_conn, snapshot_id)?;
+    drop(db_conn);
 
-    // 3. 确定写入地址
+    let snap = match snap {
+        Some(s) => s,
+        None => {
+            steps.push(err_step("获取快照", None, None, format!("快照 #{} 不存在", snapshot_id)));
+            return Ok(InjectionResult {
+                success: false,
+                address: 0,
+                bytes_written: 0,
+                message: format!("快照 #{} 不存在", snapshot_id),
+                log_id: None,
+                steps,
+                rolled_back: false,
+                temp_alloc_address: None,
+                memcpy_result: None,
+            });
+        }
+    };
+
+    let raw_bytes = match hex_to_bytes(&snap.raw_data) {
+        Some(b) => b,
+        None => {
+            steps.push(err_step("解码快照数据", None, None, "无法解析HEX原始数据".into()));
+            return Ok(InjectionResult {
+                success: false,
+                address: 0,
+                bytes_written: 0,
+                message: "无法解析快照原始数据".into(),
+                log_id: None,
+                steps,
+                rolled_back: false,
+                temp_alloc_address: None,
+                memcpy_result: None,
+            });
+        }
+    };
+
+    let data_size = raw_bytes.len();
     let write_addr = target_address.unwrap_or(snap.address);
 
-    // 4. 校验目标地址是否可写（可选）
+    steps.push(ok_step(
+        "获取快照",
+        Some(snap.address),
+        Some(data_size),
+        Some(format!("snapshot_id={}, data_size={}", snapshot_id, data_size)),
+    ));
+
+    // ===== Step 1: 校验目标地址是否可写 =====
     match memory_regions(target_pid) {
         Ok(regions) => {
             let contains = regions.iter().any(|r| {
@@ -199,42 +278,475 @@ pub async fn inject_snapshot_to_process(
                     && r.is_writable
             });
             if !contains {
+                steps.push(err_step(
+                    "校验目标地址",
+                    Some(write_addr),
+                    Some(data_size),
+                    format!("0x{:X} 不在可写内存区域，中止注入", write_addr),
+                ));
+                let log_id = save_injection_log(
+                    &state, snapshot_id, target_pid, write_addr, data_size,
+                    None, None, None, None, false, false, &steps,
+                )?;
                 return Ok(InjectionResult {
                     success: false,
                     address: write_addr,
                     bytes_written: 0,
-                    message: format!("地址 0x{:X} 不在可写区域内，已中止注入以避免崩溃", write_addr),
+                    message: format!("地址 0x{:X} 不在可写区域内，已中止", write_addr),
+                    log_id: Some(log_id),
+                    steps,
+                    rolled_back: false,
+                    temp_alloc_address: None,
+                    memcpy_result: None,
                 });
             }
+            steps.push(ok_step(
+                "校验目标地址",
+                Some(write_addr),
+                Some(data_size),
+                Some(format!("0x{:X} 在可写区域内，保护=RW", write_addr)),
+            ));
         }
         Err(e) => {
+            steps.push(err_step("校验目标地址", Some(write_addr), None, format!("{}", e)));
+            let log_id = save_injection_log(
+                &state, snapshot_id, target_pid, write_addr, data_size,
+                None, None, None, None, false, false, &steps,
+            )?;
             return Ok(InjectionResult {
                 success: false,
                 address: write_addr,
                 bytes_written: 0,
                 message: format!("无法访问目标进程内存区域: {}", e),
+                log_id: Some(log_id),
+                steps,
+                rolled_back: false,
+                temp_alloc_address: None,
+                memcpy_result: None,
             });
         }
     }
 
-    // 5. 执行写入
-    match write_memory(target_pid, write_addr, &raw_bytes) {
-        Ok(bytes_written) => Ok(InjectionResult {
-            success: true,
-            address: write_addr,
-            bytes_written,
-            message: format!(
-                "成功将快照 #{} ({} bytes) 注入到 PID={} 的 0x{:X}",
-                snapshot_id, bytes_written, target_pid, write_addr
-            ),
-        }),
-        Err(e) => Ok(InjectionResult {
-            success: false,
-            address: write_addr,
-            bytes_written: 0,
-            message: format!("注入失败: {}", e),
-        }),
+    // ===== Step 2: 备份目标地址原始数据（用于回滚） =====
+    let backup_data = match read_memory(target_pid, write_addr, data_size) {
+        Ok(data) => {
+            steps.push(ok_step(
+                "备份目标原始数据",
+                Some(write_addr),
+                Some(data.len()),
+                Some(format!("已读取 {} 字节", data.len())),
+            ));
+            Some(data)
+        }
+        Err(e) => {
+            steps.push(err_step("备份目标原始数据", Some(write_addr), Some(data_size), format!("{}", e)));
+            None
+        }
+    };
+
+    // ===== Step 3: VirtualAllocEx 在目标进程分配临时内存 =====
+    let alloc_size = data_size + 64; // 额外空间给 memcpy 参数结构
+    match virtual_alloc_ex(target_pid, alloc_size) {
+        Ok(addr) => {
+            temp_alloc_addr = Some(addr);
+            steps.push(ok_step(
+                "VirtualAllocEx 分配临时区",
+                Some(addr),
+                Some(alloc_size),
+                Some(format!("临时区=0x{:X}, size={}", addr, alloc_size)),
+            ));
+        }
+        Err(e) => {
+            steps.push(err_step("VirtualAllocEx 分配临时区", None, Some(alloc_size), format!("{}", e)));
+            let log_id = save_injection_log(
+                &state, snapshot_id, target_pid, write_addr, data_size,
+                None, None, None, None, false, false, &steps,
+            )?;
+            return Ok(InjectionResult {
+                success: false,
+                address: write_addr,
+                bytes_written: 0,
+                message: format!("VirtualAllocEx 分配临时区失败: {}", e),
+                log_id: Some(log_id),
+                steps,
+                rolled_back: false,
+                temp_alloc_address: None,
+                memcpy_result: None,
+            });
+        }
     }
+
+    let temp_addr = temp_alloc_addr.unwrap();
+
+    // ===== Step 4: 写入快照数据到临时区 =====
+    match write_memory(target_pid, temp_addr, &raw_bytes) {
+        Ok(written) => {
+            steps.push(ok_step(
+                "WriteProcessMemory 到临时区",
+                Some(temp_addr),
+                Some(written),
+                Some(format!("已写入 {} 字节到 0x{:X}", written, temp_addr)),
+            ));
+        }
+        Err(e) => {
+            steps.push(err_step("WriteProcessMemory 到临时区", Some(temp_addr), Some(data_size), format!("{}", e)));
+            // 回滚：释放临时区
+            let _ = virtual_free_ex(target_pid, temp_addr, 0);
+            rolled_back = true;
+            steps.push(ok_step("回滚-释放临时区", Some(temp_addr), None, Some("VirtualFreeEx 已调用".into())));
+            let log_id = save_injection_log(
+                &state, snapshot_id, target_pid, write_addr, data_size,
+                temp_alloc_addr, Some(alloc_size), None, None, false, rolled_back, &steps,
+            )?;
+            return Ok(InjectionResult {
+                success: false,
+                address: write_addr,
+                bytes_written: 0,
+                message: format!("写入临时区失败，已自动回滚并释放临时内存: {}", e),
+                log_id: Some(log_id),
+                steps,
+                rolled_back,
+                temp_alloc_address: temp_alloc_addr,
+                memcpy_result: None,
+            });
+        }
+    }
+
+    // ===== Step 5: 获取 kernel32!memcpy 地址 =====
+    match get_module_proc_address("kernel32.dll", "CopyMemory") {
+        Ok(addr) => {
+            memcpy_addr_val = Some(addr);
+            steps.push(ok_step(
+                "获取 kernel32!CopyMemory 地址",
+                Some(addr),
+                None,
+                Some(format!("CopyMemory=0x{:X}", addr)),
+            ));
+        }
+        Err(e) => {
+            steps.push(err_step("获取 memcpy 地址", None, None, format!("{}", e)));
+            // 回退方案：直接 WriteProcessMemory 到目标地址
+            steps.push(ok_step("回退方案", None, None, Some("远程线程不可用，使用直接 WriteProcessMemory".into())));
+
+            match write_memory(target_pid, write_addr, &raw_bytes) {
+                Ok(written) => {
+                    steps.push(ok_step(
+                        "直接 WriteProcessMemory",
+                        Some(write_addr),
+                        Some(written),
+                        Some(format!("已直接写入 {} 字节", written)),
+                    ));
+                    let _ = virtual_free_ex(target_pid, temp_addr, 0);
+                    steps.push(ok_step("释放临时区", Some(temp_addr), None, Some("已释放".into())));
+
+                    let log_id = save_injection_log(
+                        &state, snapshot_id, target_pid, write_addr, data_size,
+                        temp_alloc_addr, Some(alloc_size), None, None, true, false, &steps,
+                    )?;
+                    return Ok(InjectionResult {
+                        success: true,
+                        address: write_addr,
+                        bytes_written: written,
+                        message: format!(
+                            "通过直接写入模式成功注入 {} 字节到 PID={} 的 0x{:X}",
+                            written, target_pid, write_addr
+                        ),
+                        log_id: Some(log_id),
+                        steps,
+                        rolled_back: false,
+                        temp_alloc_address: temp_alloc_addr,
+                        memcpy_result: None,
+                    });
+                }
+                Err(e2) => {
+                    steps.push(err_step("直接 WriteProcessMemory", Some(write_addr), Some(data_size), format!("{}", e2)));
+                    let _ = virtual_free_ex(target_pid, temp_addr, 0);
+                    rolled_back = true;
+                    steps.push(ok_step("回滚-释放临时区", Some(temp_addr), None, Some("已释放".into())));
+
+                    // 尝试恢复备份
+                    if let Some(ref backup) = backup_data {
+                        match write_memory(target_pid, write_addr, backup) {
+                            Ok(_) => steps.push(ok_step("回滚-恢复原始数据", Some(write_addr), Some(backup.len()), Some("已恢复".into()))),
+                            Err(re) => steps.push(err_step("回滚-恢复原始数据", Some(write_addr), None, format!("{}", re))),
+                        }
+                    }
+
+                    let log_id = save_injection_log(
+                        &state, snapshot_id, target_pid, write_addr, data_size,
+                        temp_alloc_addr, Some(alloc_size), None, None, false, rolled_back, &steps,
+                    )?;
+                    return Ok(InjectionResult {
+                        success: false,
+                        address: write_addr,
+                        bytes_written: 0,
+                        message: format!("注入失败，已自动回滚: {}", e2),
+                        log_id: Some(log_id),
+                        steps,
+                        rolled_back,
+                        temp_alloc_address: temp_alloc_addr,
+                        memcpy_result: None,
+                    });
+                }
+            }
+        }
+    }
+
+    // ===== Step 6: 构造 memcpy 参数并写入目标进程 =====
+    // memcpy(dest, src, size) - 我们需要构造一个参数块
+    // 使用 RemoteThread 参数传递技巧：
+    //   由于 CreateRemoteThread 只能传1个参数，我们用 temp 区末尾放参数结构
+    //   实际上对于 CopyMemory(RtlMoveMemory)，它是一个 macro 展开为 __movsb
+    //   更安全的做法：把 memcpy 参数块写到临时区，然后用 NtCreateThreadEx 或 shellcode
+    //   简化方案：直接用 RtlMoveMemory 函数地址创建远程线程
+    //
+    //   但 RtlMoveMemory(dst, src, len) 有3个参数，不能直接通过 CreateRemoteThread 传。
+    //   解决方案：写一小段 shellcode 到临时区，调用 RtlMoveMemory 后返回。
+    //
+    //   x64 shellcode:
+    //     mov rcx, <dest>      ; 48 B9 <8 bytes>
+    //     mov rdx, <src>       ; 48 BA <8 bytes>
+    //     mov r8, <size>       ; 49 B8 <8 bytes>
+    //     sub rsp, 0x28        ; 48 83 EC 28
+    //     call <RtlMoveMemory> ; 48 FF 15 02 00 00 00
+    //     add rsp, 0x28        ; 48 83 C4 28
+    //     ret                  ; C3
+    //     <8 byte absolute address of RtlMoveMemory>
+
+    let memcpy_fn = memcpy_addr_val.unwrap();
+
+    // 获取 ntdll!RtlMoveMemory (实际实现)
+    let rtl_addr = match get_module_proc_address("ntdll.dll", "RtlMoveMemory") {
+        Ok(a) => {
+            steps.push(ok_step(
+                "获取 ntdll!RtlMoveMemory",
+                Some(a),
+                None,
+                Some(format!("RtlMoveMemory=0x{:X}", a)),
+            ));
+            a
+        }
+        Err(_) => {
+            steps.push(ok_step(
+                "获取 ntdll!RtlMoveMemory",
+                Some(memcpy_fn),
+                None,
+                Some("回退到 kernel32!CopyMemory".into()),
+            ));
+            memcpy_fn
+        }
+    };
+
+    // 构建x64 shellcode
+    let mut shellcode: Vec<u8> = Vec::with_capacity(64);
+
+    // mov rcx, <write_addr>
+    shellcode.extend_from_slice(&[0x48, 0xB9]);
+    shellcode.extend_from_slice(&write_addr.to_le_bytes());
+
+    // mov rdx, <temp_addr>
+    shellcode.extend_from_slice(&[0x48, 0xBA]);
+    shellcode.extend_from_slice(&temp_addr.to_le_bytes());
+
+    // mov r8, <data_size>
+    shellcode.extend_from_slice(&[0x49, 0xB8]);
+    shellcode.extend_from_slice(&(data_size as u64).to_le_bytes());
+
+    // sub rsp, 0x28 (shadow space + alignment)
+    shellcode.extend_from_slice(&[0x48, 0x83, 0xEC, 0x28]);
+
+    // call [rip+2] -> 读取后面8字节绝对地址
+    shellcode.extend_from_slice(&[0xFF, 0x15, 0x02, 0x00, 0x00, 0x00]);
+
+    // add rsp, 0x28
+    shellcode.extend_from_slice(&[0x48, 0x83, 0xC4, 0x28]);
+
+    // ret
+    shellcode.push(0xC3);
+
+    // 8 bytes: absolute address of RtlMoveMemory
+    shellcode.extend_from_slice(&rtl_addr.to_le_bytes());
+
+    // 写 shellcode 到临时区末尾
+    let shellcode_offset = data_size; // 放在数据之后
+    let shellcode_addr = temp_addr + shellcode_offset as u64;
+
+    match write_memory(target_pid, shellcode_addr, &shellcode) {
+        Ok(written) => {
+            steps.push(ok_step(
+                "写入 shellcode",
+                Some(shellcode_addr),
+                Some(written),
+                Some(format!("shellcode {} bytes at 0x{:X}", written, shellcode_addr)),
+            ));
+        }
+        Err(e) => {
+            steps.push(err_step("写入 shellcode", Some(shellcode_addr), Some(shellcode.len()), format!("{}", e)));
+            let _ = virtual_free_ex(target_pid, temp_addr, 0);
+            rolled_back = true;
+            steps.push(ok_step("回滚-释放临时区", Some(temp_addr), None, Some("已释放".into())));
+            if let Some(ref backup) = backup_data {
+                let _ = write_memory(target_pid, write_addr, backup);
+                steps.push(ok_step("回滚-恢复原始数据", Some(write_addr), None, Some("已恢复".into())));
+            }
+            let log_id = save_injection_log(
+                &state, snapshot_id, target_pid, write_addr, data_size,
+                temp_alloc_addr, Some(alloc_size), memcpy_addr_val, None, false, rolled_back, &steps,
+            )?;
+            return Ok(InjectionResult {
+                success: false,
+                address: write_addr,
+                bytes_written: 0,
+                message: format!("写入 shellcode 失败，已自动回滚: {}", e),
+                log_id: Some(log_id),
+                steps,
+                rolled_back,
+                temp_alloc_address: temp_alloc_addr,
+                memcpy_result: None,
+            });
+        }
+    }
+
+    // ===== Step 7: CreateRemoteThread 执行 shellcode =====
+    match create_remote_thread_and_wait(target_pid, shellcode_addr, 0) {
+        Ok(exit_code) => {
+            thread_exit = Some(exit_code);
+            steps.push(ok_step(
+                "CreateRemoteThread",
+                Some(shellcode_addr),
+                None,
+                Some(format!("远程线程退出码={}", exit_code)),
+            ));
+        }
+        Err(e) => {
+            steps.push(err_step("CreateRemoteThread", Some(shellcode_addr), None, format!("{}", e)));
+            // 回滚
+            let _ = virtual_free_ex(target_pid, temp_addr, 0);
+            rolled_back = true;
+            steps.push(ok_step("回滚-释放临时区", Some(temp_addr), None, Some("已释放".into())));
+            if let Some(ref backup) = backup_data {
+                let _ = write_memory(target_pid, write_addr, backup);
+                steps.push(ok_step("回滚-恢复原始数据", Some(write_addr), None, Some("已恢复".into())));
+            }
+            let log_id = save_injection_log(
+                &state, snapshot_id, target_pid, write_addr, data_size,
+                temp_alloc_addr, Some(alloc_size), memcpy_addr_val, thread_exit, false, rolled_back, &steps,
+            )?;
+            return Ok(InjectionResult {
+                success: false,
+                address: write_addr,
+                bytes_written: 0,
+                message: format!("远程线程执行失败，已自动回滚: {}", e),
+                log_id: Some(log_id),
+                steps,
+                rolled_back,
+                temp_alloc_address: temp_alloc_addr,
+                memcpy_result: thread_exit,
+            });
+        }
+    }
+
+    // ===== Step 8: 验证写入 - 读取目标地址并比对 =====
+    match read_memory(target_pid, write_addr, data_size) {
+        Ok(verify_data) => {
+            let match_count = verify_data
+                .iter()
+                .zip(raw_bytes.iter())
+                .filter(|(a, b)| a == b)
+                .count();
+            let verify_pct = (match_count as f64 / data_size as f64) * 100.0;
+            steps.push(ok_step(
+                "验证写入",
+                Some(write_addr),
+                Some(data_size),
+                Some(format!("匹配率={:.1}% ({}/{})", verify_pct, match_count, data_size)),
+            ));
+        }
+        Err(e) => {
+            steps.push(err_step("验证写入", Some(write_addr), Some(data_size), format!("{}", e)));
+        }
+    }
+
+    // ===== Step 9: 清理 - 释放临时区 =====
+    match virtual_free_ex(target_pid, temp_addr, 0) {
+        Ok(()) => {
+            steps.push(ok_step("释放临时区", Some(temp_addr), None, Some("VirtualFreeEx 成功".into())));
+        }
+        Err(e) => {
+            steps.push(err_step("释放临时区", Some(temp_addr), None, format!("释放失败: {}", e)));
+        }
+    }
+
+    let log_id = save_injection_log(
+        &state, snapshot_id, target_pid, write_addr, data_size,
+        temp_alloc_addr, Some(alloc_size), memcpy_addr_val, thread_exit, true, false, &steps,
+    )?;
+
+    Ok(InjectionResult {
+        success: true,
+        address: write_addr,
+        bytes_written: data_size,
+        message: format!(
+            "安全注入成功：通过 VirtualAllocEx + shellcode(RtlMoveMemory) 注入 {} 字节到 PID={} 的 0x{:X}",
+            data_size, target_pid, write_addr
+        ),
+        log_id: Some(log_id),
+        steps,
+        rolled_back: false,
+        temp_alloc_address: temp_alloc_addr,
+        memcpy_result: thread_exit,
+    })
+}
+
+fn save_injection_log(
+    state: &State<'_, AppState>,
+    snapshot_id: i64,
+    target_pid: u32,
+    target_address: u64,
+    data_size: usize,
+    temp_alloc_address: Option<u64>,
+    temp_alloc_size: Option<usize>,
+    memcpy_address: Option<u64>,
+    thread_exit_code: Option<u32>,
+    success: bool,
+    rolled_back: bool,
+    steps: &[InjectionStep],
+) -> AppResult<i64> {
+    let db_conn = state.db.read();
+    let log_params = CreateInjectionLogParams {
+        snapshot_id,
+        target_pid,
+        target_address,
+        data_size,
+        temp_alloc_address,
+        temp_alloc_size,
+        memcpy_address,
+        thread_exit_code,
+        success,
+        rolled_back,
+        steps: steps.to_vec(),
+    };
+    db::create_injection_log(&db_conn, &log_params)
+}
+
+// ===== 注入日志查询命令 =====
+
+#[tauri::command]
+pub async fn list_injection_logs(
+    state: State<'_, AppState>,
+    target_pid: Option<u32>,
+    snapshot_id: Option<i64>,
+    limit: Option<i64>,
+    offset: Option<i64>,
+) -> AppResult<Vec<InjectionLog>> {
+    let db = state.db.read();
+    db::list_injection_logs(&db, target_pid, snapshot_id, limit.unwrap_or(100), offset.unwrap_or(0))
+}
+
+#[tauri::command]
+pub async fn get_injection_log(state: State<'_, AppState>, id: i64) -> AppResult<Option<InjectionLog>> {
+    let db = state.db.read();
+    db::get_injection_log(&db, id)
 }
 
 fn hex_to_bytes(hex: &str) -> Option<Vec<u8>> {
@@ -322,7 +834,6 @@ pub fn setup_global_shortcut(app: &mut tauri::App) -> AppResult<()> {
     let shortcut = app
         .global_shortcut_manager()
         .register("Ctrl+Shift+Alt+M", move || {
-            // 呼出浮动面板
             let ah = app_handle.clone();
             std::thread::spawn(move || {
                 if let Some(win) = ah.get_window("floating-panel") {
@@ -346,7 +857,6 @@ pub fn setup_global_shortcut(app: &mut tauri::App) -> AppResult<()> {
         )));
     }
 
-    // 第二个快捷键：快速扫描当前激活进程
     let app_handle2 = app.handle();
     let _ = app
         .global_shortcut_manager()

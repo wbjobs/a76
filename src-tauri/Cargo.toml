@@ -29,7 +29,7 @@ anyhow = "1"
 parking_lot = "0.12"
 
 [target.'cfg(windows)'.dependencies]
-winapi = { version = "0.3", features = ["tlhelp32", "memoryapi", "processthreadsapi", "handleapi", "psapi", "winbase", "synchapi", "winnt", "errhandlingapi", "securitybaseapi", "wow64apiset", "libloaderapi", "windef"] }
+winapi = { version = "0.3", features = ["tlhelp32", "memoryapi", "processthreadsapi", "handleapi", "psapi", "winbase", "synchapi", "winnt", "errhandlingapi", "securitybaseapi", "wow64apiset", "libloaderapi", "windef", "impl-default", "minwindef", "ntdef"] }
 
 [target.'cfg(target_os = "macos")'.dependencies]
 mach = "0.3"

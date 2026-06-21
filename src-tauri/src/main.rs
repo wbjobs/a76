@@ -45,6 +45,8 @@ fn main() {
             update_snapshot_note,
             count_snapshots,
             inject_snapshot_to_process,
+            list_injection_logs,
+            get_injection_log,
             set_active_pid,
             get_active_pid,
             set_monitored_pids,
