@@ -1,0 +1,13 @@
+[workspace]
+members = ["src-tauri"]
+
+[package]
+name = "mem-snapshot-tool"
+version = "0.1.0"
+description = "Process Memory Snapshot & Injection Tool"
+authors = ["dev"]
+edition = "2021"
+
+[lib]
+name = "mem_snapshot_tool"
+crate-type = ["cdylib", "rlib"]

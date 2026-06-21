@@ -1,0 +1,41 @@
+[package]
+name = "mem-snapshot-tool"
+version = "0.1.0"
+description = "Process Memory Snapshot & Injection Tool"
+authors = ["dev"]
+edition = "2021"
+
+[lib]
+name = "mem_snapshot_tool_lib"
+crate-type = ["staticlib", "cdylib", "rlib"]
+
+[[bin]]
+name = "mem-snapshot-tool"
+path = "src/main.rs"
+
+[build-dependencies]
+tauri-build = { version = "1.5", features = [] }
+
+[dependencies]
+tauri = { version = "1.5", features = ["dialog-all", "fs-all", "path-all", "shell-all", "window-all", "global-shortcut-all"] }
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"
+rusqlite = { version = "0.31", features = ["bundled", "chrono"] }
+chrono = { version = "0.4", features = ["serde"] }
+regex = { version = "1", features = ["perf", "unicode-perl"] }
+base64 = "0.22"
+thiserror = "1"
+anyhow = "1"
+parking_lot = "0.12"
+
+[target.'cfg(windows)'.dependencies]
+winapi = { version = "0.3", features = ["tlhelp32", "memoryapi", "processthreadsapi", "handleapi", "psapi", "winbase", "synchapi", "winnt", "errhandlingapi", "securitybaseapi", "wow64apiset", "libloaderapi", "windef"] }
+
+[target.'cfg(target_os = "macos")'.dependencies]
+mach = "0.3"
+mach2 = "0.4"
+libproc = "0.14"
+
+[features]
+default = ["custom-protocol"]
+custom-protocol = ["tauri/custom-protocol"]

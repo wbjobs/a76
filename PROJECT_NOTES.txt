@@ -1,0 +1,112 @@
+使用说明
+========
+
+本项目是跨平台进程内存监控与快照注入工具 (MemSnapshot)。
+
+技术栈：
+  - 前端：React + TypeScript + Tailwind CSS + Vite
+  - 桌面外壳：Tauri 1.x
+  - 后端（原生系统调用）：Rust
+
+一、安装依赖
+============
+
+前置条件：
+  - Node.js >= 18
+  - Rust 工具链（rustc、cargo）
+  - Tauri 要求的系统依赖
+      * Windows: Visual Studio Build Tools (C++ 桌面开发 + Windows 10/11 SDK) + WebView2 (Win10自带)
+      * macOS: Xcode Command Line Tools (`xcode-select --install`)
+
+步骤：
+  1. 安装前端依赖：
+     npm install
+     # 或
+     pnpm install / yarn
+
+二、开发调试
+============
+
+  # 启动前端 + Rust Tauri 联合开发模式（热更新）
+  npm run tauri dev
+
+三、生产构建
+============
+
+  # 打包 Windows .exe / macOS .app
+  npm run tauri build
+
+四、功能说明
+============
+
+核心功能：
+1. 进程枚举
+   - 自动识别 浏览器 / IDE / 设计软件 三大类进程
+   - 支持按类别筛选、搜索
+
+2. 内存扫描（跨平台）
+   Windows：使用 ReadProcessMemory / VirtualQueryEx
+   macOS：  使用 mach_vm_read / mach_vm_region
+
+   支持识别：
+   - JSON 对象/数组（花括号/方括号匹配 + 语法校验）
+   - Python Pickle 序列化数据（0x80 PROTO 标记）
+   - Base64 编码块（可自动解码预览）
+   - 用户自定义正则表达式匹配
+
+3. SQLite 快照存储
+   数据库位置：
+     Windows: %USERPROFILE%\.mem_snapshot_tool\snapshots.db
+     macOS:   ~/.mem_snapshot_tool/snapshots.db
+
+   每张快照包含：原始字节(HEX)、解析内容、内存地址、大小、时间戳、备注
+
+4. 内存注入
+   Windows: WriteProcessMemory
+   macOS:   mach_vm_write
+
+   注入前自动检查目标地址是否在可写区域内，防止崩溃。
+
+5. 全局快捷键
+   Ctrl+Shift+Alt+M  -> 呼出/隐藏全局浮动面板
+   Ctrl+Shift+Alt+S  -> 对当前激活进程执行快速扫描
+
+五、目录结构
+============
+
+  e:\trae3\a76\
+  ├─ src-tauri/                 # Rust 后端
+  │  ├─ src/
+  │  │  ├─ main.rs              # 程序入口
+  │  │  ├─ process.rs           # 平台相关：进程枚举 + 内存读写 (Windows/macOS)
+  │  │  ├─ scanner.rs           # 内存特征扫描 (JSON/Pickle/Base64/Regex)
+  │  │  ├─ db.rs                # SQLite 快照持久化
+  │  │  ├─ commands.rs          # 暴露给前端的 Tauri 命令
+  │  │  ├─ state.rs             # 共享状态（DB连接、激活PID等）
+  │  │  ├─ types.rs             # 数据结构定义
+  │  │  └─ error.rs             # 错误类型
+  │  └─ tauri.conf.json         # Tauri 配置
+  │
+  ├─ src/                       # React 前端
+  │  ├─ pages/
+  │  │  ├─ MainApp.tsx          # 主窗口
+  │  │  └─ FloatingPanel.tsx    # 快捷键呼出的浮动面板
+  │  ├─ components/             # UI 组件
+  │  ├─ api.ts                  # Tauri invoke 封装
+  │  ├─ utils.ts                # 工具函数
+  │  ├─ main.tsx                # 主窗口入口
+  │  └─ floating.tsx            # 浮动面板入口
+  │
+  ├─ index.html                 # 主窗口 HTML
+  ├─ floating.html              # 浮动面板 HTML
+  ├─ vite.config.ts             # Vite 多入口配置
+  └─ package.json
+
+六、安全与合规
+==============
+
+注意：
+  - 本工具用于调试、逆向分析、软件测试等合法场景
+  - 跨进程读写内存可能违反目标软件的 EULA，请确保拥有相关权限
+  - macOS 下使用 task_for_pid 需要 root 或特殊 entitlement
+  - 注入操作存在风险，建议在测试环境/沙箱中执行

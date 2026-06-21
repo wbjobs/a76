@@ -32,3 +32,20 @@ __pycache__/
 # Env
 .env
 .env.local
+
+# Rust / Cargo
+target/
+Cargo.lock
+src-tauri/target/
+src-tauri/Cargo.lock
+
+# Tauri generated
+src-tauri/gen/
+src-tauri/icons/*
+!src-tauri/icons/.gitkeep
+
+# App data (user local db)
+*.db
+*.sqlite
+*.sqlite3
+
